@@ -285,3 +285,11 @@ Write-Host "`nDONE. Reboot now to apply all changes (especially VBS/Search/Widge
 Stop-Transcript | Out-Null
 Write-Host "Log: $LOG" -ForegroundColor Cyan
 Write-Host "Service backup: $svcBackup" -ForegroundColor Cyan
+-----------------------------------------------------------------------------------------------------------------------------------------
+async function inspect() {
+  const db = await AsyncDatabase.open();
+  const pizza = await db.get();
+  console.log("Pizza Name:", pizza.name);
+  console.log("Raw Ingredients:", JSON.stringify(pizza.ingredients));
+  await db.close();
+}
