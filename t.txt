@@ -1,2 +1,287 @@
 Hello Bruh 
 My name is Omar
+
+------------------
+
+# ===========================
+# HAVOC.ps1 - Win10/Win11 Pro
+# Hardcore + Gaming + Process Hunt
+# ===========================
+# Run as Administrator
+
+$ErrorActionPreference = "SilentlyContinue"
+
+# ---- knobs (you can tweak) ----
+$DO_HARDCORE   = $true
+$DO_GAMING     = $true
+$DO_PROCESS_HUNT = $true
+
+$DISABLE_DEFENDER_ATTEMPT = $true   # will try; may be blocked by Tamper Protection
+$DISABLE_EDGE_BROWSER_ATTEMPT = $true  # will try to uninstall Edge (WebView2 stays)
+$KEEP_STORE = $true  # we won't remove Microsoft Store services/apps
+
+$DISABLE_BLUETOOTH = $true   # set $false if you use Bluetooth
+$DISABLE_PRINTING  = $false  # set $true ONLY if you never print
+$DISABLE_HYPERV_VBS = $true  # turns off VBS/HVCI + hypervisorlaunchtype off (kills WSL2/Sandbox/Hyper-V)
+
+$LOG_DIR = "$env:USERPROFILE\Desktop\HAVOC-LOGS"
+New-Item -ItemType Directory -Path $LOG_DIR -Force | Out-Null
+$stamp = Get-Date -Format "yyyyMMdd-HHmmss"
+$LOG = Join-Path $LOG_DIR "havoc-$stamp.txt"
+
+Start-Transcript -Path $LOG -Force | Out-Null
+
+function Require-Admin {
+  $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()
+    ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+  if(-not $isAdmin){
+    Write-Host "Run PowerShell as Administrator." -ForegroundColor Red
+    Stop-Transcript | Out-Null
+    exit 1
+  }
+}
+Require-Admin
+
+# ---- backups ----
+$svcBackup = Join-Path $LOG_DIR "services-backup-$stamp.csv"
+Get-CimInstance Win32_Service |
+  Select-Object Name, DisplayName, StartMode, State |
+  Export-Csv $svcBackup -NoTypeInformation
+
+$taskBackup = Join-Path $LOG_DIR "scheduledtasks-$stamp.txt"
+schtasks /query /fo LIST /v > $taskBackup
+
+$startupBackup = Join-Path $LOG_DIR "startup-reg-$stamp.txt"
+reg query "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run" /s > $startupBackup 2>&1
+reg query "HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Run" /s >> $startupBackup 2>&1
+reg query "HKU\S-1-5-19\SOFTWARE\Microsoft\Windows\CurrentVersion\Run" /s >> $startupBackup 2>&1
+reg query "HKU\S-1-5-20\SOFTWARE\Microsoft\Windows\CurrentVersion\Run" /s >> $startupBackup 2>&1
+
+Write-Host "Backups saved in: $LOG_DIR" -ForegroundColor Cyan
+
+# ---- restore point (best effort) ----
+try { Checkpoint-Computer -Description "HAVOC pre-tweak" -RestorePointType "MODIFY_SETTINGS" | Out-Null } catch {}
+
+# ---- critical services (do not touch) ----
+$CRITICAL = @(
+ "RpcSs","DcomLaunch","PlugPlay","EventLog","Power","Winmgmt",
+ "Dhcp","Dnscache","NlaSvc","BFE","mpssvc","W32Time","LSM","SamSs","ProfSvc",
+ "CryptSvc","KeyIso","CngKeyIsolation","Schedule","AudioSrv","AudioEndpointBuilder",
+ "AppXSvc","ClipSVC","LicenseManager","StateRepository","TrustedInstaller","WaaSMedicSvc"
+)
+
+function Resolve-Services($patterns){
+  $names = @()
+  foreach($p in $patterns){
+    $s = Get-Service -Name $p -ErrorAction SilentlyContinue
+    if($s){ $names += $s.Name }
+  }
+  $names | Select-Object -Unique
+}
+
+function Disable-ServiceSafe($name){
+  if($CRITICAL -contains $name){
+    Write-Host "[SKIP-CRITICAL] $name" -ForegroundColor Yellow
+    return
+  }
+  $svc = Get-Service -Name $name -ErrorAction SilentlyContinue
+  if(-not $svc){ return }
+  Write-Host "[DISABLE] $name" -ForegroundColor Green
+  try { Stop-Service $name -Force } catch {}
+  try { Set-Service $name -StartupType Disabled } catch { sc.exe config $name start= disabled | Out-Null }
+}
+
+function Manual-ServiceSafe($name){
+  if($CRITICAL -contains $name){ return }
+  $svc = Get-Service -Name $name -ErrorAction SilentlyContinue
+  if(-not $svc){ return }
+  Write-Host "[MANUAL]  $name" -ForegroundColor Magenta
+  try { Set-Service $name -StartupType Manual } catch { sc.exe config $name start= demand | Out-Null }
+}
+
+# ===========================
+# HARDCORE (Services + Policies)
+# ===========================
+if($DO_HARDCORE){
+
+  Write-Host "`n=== HARDCORE PACK ===`n" -ForegroundColor Cyan
+
+  # --- Telemetry / CEIP / Error reporting ---
+  $telemetry = @("DiagTrack","dmwappushservice","WerSvc")
+  foreach($n in (Resolve-Services $telemetry)){ Disable-ServiceSafe $n }
+
+  # --- Cross-device / sync / phone / user data (kills CrossDeviceResume family) ---
+  $cross = @(
+    "CDPSvc","CDPUserSvc*","OneSyncSvc*","UserDataSvc*","UnistoreSvc*","PimIndexMaintenanceSvc*",
+    "DevicesFlowUserSvc*","MessagingService*","PhoneSvc"
+  )
+  foreach($n in (Resolve-Services $cross)){ Disable-ServiceSafe $n }
+
+  # --- Search / Web search policies ---
+  # Service (indexing)
+  foreach($n in (Resolve-Services @("WSearch"))){ Disable-ServiceSafe $n }
+
+  # Registry policies to kill web search
+  reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows\Windows Search" /v "DisableWebSearch" /t REG_DWORD /d 1 /f | Out-Null
+  reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows\Windows Search" /v "ConnectedSearchUseWeb" /t REG_DWORD /d 0 /f | Out-Null
+  reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows\Windows Search" /v "AllowCortana" /t REG_DWORD /d 0 /f | Out-Null
+  reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Search" /v "BingSearchEnabled" /t REG_DWORD /d 0 /f | Out-Null
+  reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Search" /v "CortanaConsent" /t REG_DWORD /d 0 /f | Out-Null
+
+  # --- Widgets: hide + remove WebExperience Pack (Widgets backend) ---
+  reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" /v "TaskbarDa" /t REG_DWORD /d 0 /f | Out-Null
+  reg add "HKLM\SOFTWARE\Policies\Microsoft\Dsh" /v "AllowNewsAndInterests" /t REG_DWORD /d 0 /f | Out-Null
+
+  # Remove Windows Web Experience Pack (Widgets)
+  try {
+    Get-AppxPackage -AllUsers *WebExperience* | Remove-AppxPackage -AllUsers
+  } catch {}
+  try {
+    Get-AppxProvisionedPackage -Online | Where-Object {$_.DisplayName -like "*WebExperience*"} |
+      Remove-AppxProvisionedPackage -Online
+  } catch {}
+
+  # --- OneDrive: disable setup run entries + uninstall attempt ---
+  reg delete "HKU\S-1-5-19\SOFTWARE\Microsoft\Windows\CurrentVersion\Run" /v "OneDriveSetup" /f | Out-Null
+  reg delete "HKU\S-1-5-20\SOFTWARE\Microsoft\Windows\CurrentVersion\Run" /v "OneDriveSetup" /f | Out-Null
+
+  # Optional uninstall OneDrive (won't touch your 1.vhd/2.vhd)
+  $od1 = "$env:SystemRoot\System32\OneDriveSetup.exe"
+  $od2 = "$env:SystemRoot\SysWOW64\OneDriveSetup.exe"
+  if(Test-Path $od1){ & $od1 /uninstall | Out-Null }
+  if(Test-Path $od2){ & $od2 /uninstall | Out-Null }
+
+  # --- Adobe: run only when you open it (disable updater service + task) ---
+  foreach($n in (Resolve-Services @("AdobeARMservice","Adobe Acrobat Update Service"))){ Disable-ServiceSafe $n }
+  schtasks /Change /TN "\Adobe Acrobat Update Task" /Disable | Out-Null
+
+  # --- Bluetooth / Printing (optional) ---
+  if($DISABLE_BLUETOOTH){
+    foreach($n in (Resolve-Services @("bthserv","BTAGService","BthAvctpSvc"))){ Disable-ServiceSafe $n }
+  }
+  if($DISABLE_PRINTING){
+    foreach($n in (Resolve-Services @("Spooler"))){ Disable-ServiceSafe $n }
+  }
+
+  # --- Microsoft PC Manager (you have MSPCManagerService in top RAM) ---
+  foreach($n in (Resolve-Services @("MSPCManagerService"))){ Disable-ServiceSafe $n }
+
+  # --- SecurityHealth systray (tray only) ---
+  reg delete "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run" /v "SecurityHealth" /f | Out-Null
+}
+
+# ===========================
+# GAMING PACK (latency/overhead)
+# ===========================
+if($DO_GAMING){
+
+  Write-Host "`n=== GAMING PACK ===`n" -ForegroundColor Cyan
+
+  # Disable GameDVR
+  reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows\GameDVR" /v "AllowGameDVR" /t REG_DWORD /d 0 /f | Out-Null
+  reg add "HKCU\System\GameConfigStore" /v "GameDVR_Enabled" /t REG_DWORD /d 0 /f | Out-Null
+
+  # VBS/HVCI/Hypervisor off (kills WSL2/Sandbox/Hyper-V)
+  if($DISABLE_HYPERV_VBS){
+    reg add "HKLM\SYSTEM\CurrentControlSet\Control\DeviceGuard" /v "EnableVirtualizationBasedSecurity" /t REG_DWORD /d 0 /f | Out-Null
+    reg add "HKLM\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity" /v "Enabled" /t REG_DWORD /d 0 /f | Out-Null
+    bcdedit /set hypervisorlaunchtype off | Out-Null
+  }
+
+  # Ultimate Performance plan (if available)
+  try {
+    $guid = (powercfg -duplicatescheme e9a42b02-d5df-448d-aa00-03f14749eb61) -match "GUID" | Out-Null
+    $plans = powercfg /list
+    $u = ($plans | Select-String "Ultimate Performance").ToString()
+    if($u){
+      $ug = ($u -split '\s+')[3]
+      powercfg /setactive $ug | Out-Null
+    }
+  } catch {}
+}
+
+# ===========================
+# DEFENDER PACK (attempt)
+# ===========================
+if($DISABLE_DEFENDER_ATTEMPT){
+
+  Write-Host "`n=== DEFENDER ATTEMPT ===`n" -ForegroundColor Cyan
+  Write-Host "If Tamper Protection is ON, Windows may block/revert this." -ForegroundColor Yellow
+
+  # Try preferences (may require reboot, may be blocked)
+  try {
+    Set-MpPreference -DisableRealtimeMonitoring $true
+    Set-MpPreference -DisableBehaviorMonitoring $true
+    Set-MpPreference -DisableIOAVProtection $true
+    Set-MpPreference -DisableBlockAtFirstSeen $true
+    Set-MpPreference -SubmitSamplesConsent 2
+    Set-MpPreference -MAPSReporting 0
+  } catch {}
+
+  # Try services (may fail on protected systems)
+  foreach($n in (Resolve-Services @("WinDefend","WdNisSvc","Sense"))){
+    Disable-ServiceSafe $n
+  }
+
+  # Disable Defender scheduled tasks (best effort)
+  try {
+    schtasks /Change /TN "\Microsoft\Windows\Windows Defender\Windows Defender Scheduled Scan" /Disable | Out-Null
+    schtasks /Change /TN "\Microsoft\Windows\Windows Defender\Windows Defender Cache Maintenance" /Disable | Out-Null
+    schtasks /Change /TN "\Microsoft\Windows\Windows Defender\Windows Defender Cleanup" /Disable | Out-Null
+    schtasks /Change /TN "\Microsoft\Windows\Windows Defender\Windows Defender Verification" /Disable | Out-Null
+  } catch {}
+}
+
+# ===========================
+# EDGE PACK (attempt)
+# ===========================
+if($DISABLE_EDGE_BROWSER_ATTEMPT){
+
+  Write-Host "`n=== EDGE BROWSER ATTEMPT ===`n" -ForegroundColor Cyan
+  Write-Host "We will NOT remove WebView2 (needed for Win11 UI pieces)." -ForegroundColor Yellow
+
+  # Disable Edge update tasks (browser side)
+  try { schtasks /Change /TN "\MicrosoftEdgeUpdateTaskMachineCore" /Disable | Out-Null } catch {}
+  try { schtasks /Change /TN "\MicrosoftEdgeUpdateTaskMachineUA" /Disable | Out-Null } catch {}
+
+  # Attempt uninstall Edge browser
+  $edgeBase = "$env:ProgramFiles(x86)\Microsoft\Edge\Application"
+  if(Test-Path $edgeBase){
+    $setup = Get-ChildItem $edgeBase -Recurse -Filter setup.exe | Where-Object { $_.FullName -like "*\Installer\setup.exe" } |
+             Sort-Object FullName -Descending | Select-Object -First 1
+    if($setup){
+      & $setup.FullName --uninstall --system-level --verbose-logging --force-uninstall | Out-Null
+    }
+  }
+}
+
+# ===========================
+# PROCESS HUNT (report + hints)
+# ===========================
+if($DO_PROCESS_HUNT){
+
+  Write-Host "`n=== PROCESS HUNT REPORT ===`n" -ForegroundColor Cyan
+
+  $topMem = Get-Process | Sort-Object WorkingSet64 -Descending | Select-Object -First 25 `
+    @{n="Name";e={$_.Name}},
+    @{n="Id";e={$_.Id}},
+    @{n="WS(MB)";e={[math]::Round($_.WorkingSet64/1MB,1)}},
+    @{n="CPU";e={$_.CPU}},
+    @{n="Handles";e={$_.Handles}}
+
+  $topMem | Format-Table -AutoSize
+
+  $pcount = (Get-Process).Count
+  $scount = (Get-Service | Where-Object {$_.Status -eq "Running"}).Count
+  Write-Host "`nProcessCount=$pcount  RunningServices=$scount" -ForegroundColor Cyan
+
+  Write-Host "`nNotes:" -ForegroundColor Cyan
+  Write-Host "- If you see NVIDIA Overlay multiple times: turn off In-Game Overlay inside NVIDIA App." -ForegroundColor Gray
+  Write-Host "- CrossDeviceResume should die after disabling CDP services + reboot." -ForegroundColor Gray
+  Write-Host "- If SearchHost persists: Win11 Start UI uses WebView2; can be reduced but not fully erased safely." -ForegroundColor Gray
+}
+
+Write-Host "`nDONE. Reboot now to apply all changes (especially VBS/Search/Widgets)." -ForegroundColor Cyan
+Stop-Transcript | Out-Null
+Write-Host "Log: $LOG" -ForegroundColor Cyan
+Write-Host "Service backup: $svcBackup" -ForegroundColor Cyan
